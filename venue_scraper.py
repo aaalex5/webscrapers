@@ -256,8 +256,13 @@ class EventPageFinder:
 
         return score
 
-    async def find_events_page(self, fetcher: PageFetcher, start_url: str, use_llm: bool = True) -> tuple[str, str]:
-        """Return (html, url) of the events page."""
+    async def find_events_page(self, fetcher: PageFetcher, start_url: str, use_llm: bool = True) -> tuple[str, str, Optional[str]]:
+        """Return (events_html, events_url, homepage_html) of the events page.
+
+        homepage_html is the original start-page HTML when we navigated to a
+        different events sub-page, so callers can still extract venue info from
+        it.  It is None when the start page itself already contained events.
+        """
         logger.info("Fetching starting page: %s", start_url)
         html, final_url = await fetcher.fetch(start_url)
         soup = BeautifulSoup(html, "lxml")
@@ -265,7 +270,10 @@ class EventPageFinder:
         # Check if current page already has events
         if self._page_has_events(soup):
             logger.info("Current page already contains events")
-            return html, final_url
+            return html, final_url, None
+
+        # Preserve homepage HTML for venue info extraction
+        homepage_html = html
 
         # Score all links
         base_domain = urlparse(final_url).netloc.replace("www.", "")
@@ -297,12 +305,12 @@ class EventPageFinder:
             hop_soup = BeautifulSoup(hop_html, "lxml")
             if self._page_has_events(hop_soup):
                 logger.info("Found events page at: %s", hop_url)
-                return hop_html, hop_url
+                return hop_html, hop_url, homepage_html
 
             # Even if no structured event data, a high-scoring link is likely right
             if score >= 3:
                 logger.info("Using high-scoring link as events page: %s", hop_url)
-                return hop_html, hop_url
+                return hop_html, hop_url, homepage_html
 
         # LLM fallback for finding events page
         if use_llm and links:
@@ -312,13 +320,13 @@ class EventPageFinder:
                 if llm_url and llm_url not in tried_urls:
                     hop_html, hop_url = await fetcher.fetch(llm_url)
                     logger.info("LLM suggested events page: %s", hop_url)
-                    return hop_html, hop_url
+                    return hop_html, hop_url, homepage_html
             except Exception as e:
                 logger.warning("LLM nav fallback failed: %s", e)
 
-        # Fall back to original page
+        # Fall back to original page (homepage_html is the same page, no separate homepage)
         logger.warning("Could not find a dedicated events page, using starting page")
-        return html, final_url
+        return html, final_url, None
 
     async def _llm_find_link(self, links: list, base_url: str) -> Optional[str]:
         import anthropic
@@ -394,6 +402,45 @@ def extract_jsonld(soup: BeautifulSoup) -> tuple[list[Event], Venue]:
         _process_jsonld(data, events, venue)
 
     return events, venue
+
+
+def _extract_venue_from_jsonld_schema(data, venue: Venue):
+    """Extract venue name/address from LocalBusiness/Place/Organization JSON-LD schemas."""
+    if isinstance(data, list):
+        for item in data:
+            _extract_venue_from_jsonld_schema(item, venue)
+        return
+    if not isinstance(data, dict):
+        return
+
+    if "@graph" in data:
+        _extract_venue_from_jsonld_schema(data["@graph"], venue)
+
+    t = data.get("@type", "")
+    types = t if isinstance(t, list) else [t]
+
+    business_types = {
+        "LocalBusiness", "FoodEstablishment", "BarOrPub", "NightClub",
+        "MusicVenue", "EntertainmentBusiness", "Organization", "Place",
+        "CivicStructure", "Restaurant",
+    }
+    if any(tp in business_types for tp in types):
+        if not venue.name:
+            venue.name = data.get("name")
+        if not venue.address:
+            address = data.get("address")
+            if isinstance(address, dict):
+                parts = [
+                    address.get("streetAddress", ""),
+                    address.get("addressLocality", ""),
+                    address.get("addressRegion", ""),
+                    address.get("postalCode", ""),
+                ]
+                joined = ", ".join(p for p in parts if p)
+                if joined:
+                    venue.address = joined
+            elif isinstance(address, str) and address:
+                venue.address = address
 
 
 def _process_jsonld(data, events: list[Event], venue: Venue):
@@ -782,6 +829,16 @@ def extract_venue_info(soup: BeautifulSoup, url: str) -> Venue:
     """Extract venue name and address from the page."""
     venue = Venue(url=url)
 
+    # Try JSON-LD for LocalBusiness/Organization schemas first (most reliable)
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        _extract_venue_from_jsonld_schema(data, venue)
+        if venue.name and venue.address:
+            return venue
+
     # Try og:site_name
     og_name = soup.find("meta", property="og:site_name")
     if og_name:
@@ -831,11 +888,18 @@ def extract_venue_info(soup: BeautifulSoup, url: str) -> Venue:
 class EventExtractor:
     """Runs extraction strategies in priority order."""
 
-    async def extract(self, html: str, url: str, use_llm: bool = True) -> ExtractionResult:
+    async def extract(self, html: str, url: str, use_llm: bool = True, homepage_html: Optional[str] = None) -> ExtractionResult:
         soup = BeautifulSoup(html, "lxml")
 
         # Get venue info from page metadata
         venue = extract_venue_info(soup, url)
+
+        # If the address is still missing, try the original homepage (which is more
+        # likely to carry a LocalBusiness/Organization JSON-LD with the full address)
+        if not venue.address and homepage_html:
+            home_soup = BeautifulSoup(homepage_html, "lxml")
+            home_venue = extract_venue_info(home_soup, url)
+            venue = self._merge_venue(venue, home_venue)
 
         # Strategy 1: JSON-LD
         logger.info("Trying JSON-LD extraction...")
@@ -1171,11 +1235,11 @@ async def main():
     try:
         # Step 1: Find the events page
         finder = EventPageFinder()
-        html, events_url = await finder.find_events_page(fetcher, args.url, use_llm=use_llm)
+        html, events_url, homepage_html = await finder.find_events_page(fetcher, args.url, use_llm=use_llm)
 
         # Step 2: Extract events
         extractor = EventExtractor()
-        result = await extractor.extract(html, events_url, use_llm=use_llm)
+        result = await extractor.extract(html, events_url, use_llm=use_llm, homepage_html=homepage_html)
 
         # Step 3: Filter by date range if requested
         events = result.events

@@ -1,0 +1,2 @@
+- Take out address to latitude and longitude logic so it can be called separately by another script to fill in missing pieces in the events.json
+- Useful command line prompt for venue_scraper.py: python venue_scraper.py https://chopsuey.com -d 5 --no-llm

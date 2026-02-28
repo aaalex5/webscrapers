@@ -70,10 +70,10 @@ async def scrape_venue(
     logger.info("Scraping: %s  <%s>", venue_name, url)
     try:
         finder = vs.EventPageFinder()
-        html, events_url = await finder.find_events_page(fetcher, url, use_llm=use_llm)
+        html, events_url, homepage_html = await finder.find_events_page(fetcher, url, use_llm=use_llm)
 
         extractor = vs.EventExtractor()
-        result = await extractor.extract(html, events_url, use_llm=use_llm)
+        result = await extractor.extract(html, events_url, use_llm=use_llm, homepage_html=homepage_html)
 
         events = result.events
         if days is not None:
