@@ -18,6 +18,8 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 from bs4 import BeautifulSoup, Tag
 from dateutil import parser as dateparser
 
+from event_classifier import classify_event, FINAL_CATEGORY_MAP
+
 logger = logging.getLogger("venue_scraper")
 
 
@@ -82,18 +84,6 @@ DATE_PATTERNS = [
 TIME_PATTERN = re.compile(r"\b(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM|a\.m\.|p\.m\.)?)\b")
 DOORS_PATTERN = re.compile(r"doors?\s*(?:@|at|:)?\s*(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?)", re.IGNORECASE)
 
-EVENT_TYPE_KEYWORDS = {
-    "trivia": ["trivia", "quiz night", "pub quiz", "brain game"],
-    "dj_night": ["dj ", "dj set", "dance night", "dance party", "club night", "edm night"],
-    "dance": ["swing dance", "salsa night", "line dance", "two-step", "bachata", "cumbia night"],
-    "open_mic": ["open mic", "open mike", "songwriter night", "acoustic night"],
-    "karaoke": ["karaoke"],
-    "comedy": ["comedy", "stand-up", "standup", "stand up", "comic", "laugh"],
-    "food": ["brunch", "dinner", "tasting", "pop-up dinner", "supper", "food event", "chef", "wine tasting", "beer tasting", "happy hour"],
-    "sport": ["game night", "watch party", "fight night", "ufc", "nfl", "nba", "mlb", "nhl", "soccer", "football night", "playoffs", "super bowl", "world cup"],
-    "live_music": ["live music", "concert", "band", "tour", "album release", "record release"],
-}
-
 # Prefixes applied to event titles based on event_type
 TITLE_PREFIX_MAP = {
     "live_music": "Live Show: ",
@@ -107,31 +97,6 @@ TITLE_PREFIX_MAP = {
     "comedy": "Comedy Night: ",
     "other": "",
 }
-
-# Maps internal event_type to the four output categories
-CATEGORY_MAP = {
-    "live_music": "music",
-    "dj_night": "music",
-    "open_mic": "music",
-    "dance": "music",
-    "karaoke": "music",
-    "trivia": "trivia",
-    "food": "food",
-    "sport": "sport",
-    "comedy": "other",
-    "other": "other",
-}
-
-
-def _classify_event_type(name: str, description: str = "") -> str:
-    """Classify an event into a type based on its name and description."""
-    text = f"{name} {description}".lower()
-    for event_type, keywords in EVENT_TYPE_KEYWORDS.items():
-        for kw in keywords:
-            if kw in text:
-                return event_type
-    # Default: if it has a name that looks like a performer, assume live music
-    return "live_music"
 
 
 USER_AGENT = (
@@ -513,7 +478,7 @@ def _process_jsonld(data, events: list[Event], venue: Venue):
                     venue.address = address
 
         if event.event_name and event.date:
-            event.event_type = _classify_event_type(event.event_name or "", event.description or "")
+            event.event_type = classify_event(event.event_name or "", event.description or "").internal_category
             events.append(event)
 
 
@@ -566,7 +531,7 @@ def extract_microdata(soup: BeautifulSoup) -> tuple[list[Event], Venue]:
                 venue.address = _clean_text(addr.get_text(strip=True))
 
         if event.event_name and event.date:
-            event.event_type = _classify_event_type(event.event_name or "", event.description or "")
+            event.event_type = classify_event(event.event_name or "", event.description or "").internal_category
             events.append(event)
 
     return events, venue
@@ -609,7 +574,7 @@ def extract_wp_plugins(soup: BeautifulSoup) -> list[Event]:
                 event.description = _clean_text(desc_el.get_text(strip=True))[:500]
 
             if event.event_name and event.date:
-                event.event_type = _classify_event_type(event.event_name or "", event.description or "")
+                event.event_type = classify_event(event.event_name or "", event.description or "").internal_category
                 events.append(event)
 
         if events:
@@ -629,7 +594,7 @@ def extract_wp_plugins(soup: BeautifulSoup) -> list[Event]:
                 event.date = _parse_date(dt_str)
                 event.time = _parse_time(dt_str)
             if event.event_name and event.date:
-                event.event_type = _classify_event_type(event.event_name or "", event.description or "")
+                event.event_type = classify_event(event.event_name or "", event.description or "").internal_category
                 events.append(event)
 
     return events
@@ -738,7 +703,7 @@ def extract_generic_html(soup: BeautifulSoup) -> list[Event]:
             event.description = desc_text[:500]
 
         if event.event_name and event.date:
-            event.event_type = _classify_event_type(event.event_name or "", event.description or "")
+            event.event_type = classify_event(event.event_name or "", event.description or "").internal_category
             events.append(event)
 
     return events
@@ -1133,7 +1098,7 @@ def format_output_event(event: Event, venue: Venue, venue_url: str) -> dict:
     return {
         "title": title,
         "description": description,
-        "category": CATEGORY_MAP.get(event.event_type or "", "music"),
+        "category": FINAL_CATEGORY_MAP.get(event.event_type or "", "other"),
         "address": venue.address,
         "latitude": None,
         "longitude": None,
