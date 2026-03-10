@@ -65,6 +65,7 @@ async def scrape_venue(
     url: str,
     days: Optional[int],
     use_llm: bool,
+    ask_address: bool = False,
 ) -> list[dict]:
     """Run the full scraping pipeline for a single venue. Returns formatted events."""
     logger.info("Scraping: %s  <%s>", venue_name, url)
@@ -82,6 +83,16 @@ async def scrape_venue(
         # If the page didn't expose a venue name, use the one from the spreadsheet
         if venue_name and not result.venue.name:
             result.venue.name = venue_name
+
+        # Prompt for address if not found on the page
+        if not result.venue.address:
+            if ask_address:
+                print(f"\n  Address not found for: {venue_name or url}", file=sys.stderr)
+                user_input = input("  Enter venue address (or press Enter to skip): ").strip()
+                if user_input:
+                    result.venue.address = user_input
+            else:
+                logger.warning("Address not found for %s -- rerun with --ask-address to provide it interactively", venue_name or url)
 
         # Geocode once per venue
         lat, lon = None, None
@@ -128,6 +139,8 @@ examples:
                         help="Disable LLM fallback (rule-based extraction only)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print progress and debug info to stderr")
+    parser.add_argument("--ask-address", action="store_true",
+                        help="Interactively prompt for venue address when it cannot be found on the page")
     return parser.parse_args()
 
 
@@ -160,7 +173,7 @@ async def main() -> None:
     try:
         for i, (venue_name, url) in enumerate(venues, start=1):
             print(f"[{i}/{len(venues)}] {venue_name or url}", file=sys.stderr)
-            events = await scrape_venue(fetcher, venue_name, url, args.days, use_llm)
+            events = await scrape_venue(fetcher, venue_name, url, args.days, use_llm, ask_address=args.ask_address)
             all_events.extend(events)
     finally:
         await fetcher.stop()

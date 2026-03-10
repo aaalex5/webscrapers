@@ -8,7 +8,7 @@ import logging
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
 from urllib.parse import urljoin, urlparse, quote_plus
@@ -81,7 +81,10 @@ DATE_PATTERNS = [
     re.compile(r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\b", re.IGNORECASE),
 ]
 
-TIME_PATTERN = re.compile(r"\b(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM|a\.m\.|p\.m\.)?)\b")
+TIME_PATTERN = re.compile(
+    r"\b(\d{1,2}:\d{2}\s*(?:am|pm|a\.m\.|p\.m\.)?|\d{1,2}\s*(?:am|pm|a\.m\.|p\.m\.))\b",
+    re.IGNORECASE,
+)
 DOORS_PATTERN = re.compile(r"doors?\s*(?:@|at|:)?\s*(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?)", re.IGNORECASE)
 
 # Prefixes applied to event titles based on event_type
@@ -202,6 +205,8 @@ class EventPageFinder:
             ".em-events-list", ".eventlist",
             "[itemtype*='schema.org/Event']",
             "[itemtype*='schema.org/MusicEvent']",
+            "a.fc-event[aria-label]",        # FullCalendar (TicketWeb, etc.)
+            ".tw-calendar-event-title",       # TicketWeb specific
         ]
         for sel in event_selectors:
             if soup.select_one(sel):
@@ -371,15 +376,44 @@ def _parse_date(text: str) -> Optional[str]:
 
 
 def _parse_time(text: str) -> Optional[str]:
-    """Try to parse a time string into HH:MM 24h format (in PST)."""
+    """Try to parse a time string into HH:MM 24h format (in PST).
+
+    Only returns a value when the text contains an explicit time indicator
+    (e.g. '7pm', '19:30', 'T19:30') to avoid false positives from date-only
+    strings that dateparser would resolve to midnight.
+    """
+    if not re.search(
+        r"\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)|T\d{2}:\d{2}|\d{2}:\d{2}",
+        text,
+        re.IGNORECASE,
+    ):
+        return None
     try:
         dt = dateparser.parse(text, fuzzy=True)
-        if dt and (dt.hour != 0 or dt.minute != 0):
+        if dt:
             dt = _to_pst(dt)
             return dt.strftime("%H:%M")
     except (ValueError, OverflowError):
         pass
     return None
+
+
+def _parse_iso_datetime(text: str) -> tuple[Optional[str], Optional[str]]:
+    """Parse an ISO 8601 datetime string directly (no fuzzy matching).
+
+    Returns (YYYY-MM-DD, HH:MM) for full datetimes, or (YYYY-MM-DD, None)
+    for date-only strings.  Returns (None, None) if parsing fails.
+    """
+    try:
+        normalized = text.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        dt = _to_pst(dt)
+        # No 'T' separator means date-only; don't emit a spurious 00:00 time
+        if "T" not in text:
+            return dt.strftime("%Y-%m-%d"), None
+        return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
+    except (ValueError, AttributeError):
+        return None, None
 
 
 def _clean_text(text: str) -> str:
@@ -475,15 +509,21 @@ def _process_jsonld(data, events: list[Event], venue: Venue):
         if not event.event_name:
             event.event_name = data.get("name")
 
-        # Date/time
+        # Date/time -- prefer direct ISO parsing; fall back to fuzzy for non-standard strings
         start = data.get("startDate", "")
         if start:
-            event.date = _parse_date(start)
-            event.time = _parse_time(start)
+            iso_date, iso_time = _parse_iso_datetime(start)
+            if iso_date:
+                event.date = iso_date
+                event.time = iso_time
+            else:
+                event.date = _parse_date(start)
+                event.time = _parse_time(start)
 
         door_time = data.get("doorTime", "")
         if door_time:
-            event.doors_time = _parse_time(door_time)
+            _, iso_doors = _parse_iso_datetime(door_time)
+            event.doors_time = iso_doors or _parse_time(door_time)
 
         # Description
         desc = data.get("description", "")
@@ -548,12 +588,19 @@ def extract_microdata(soup: BeautifulSoup) -> tuple[list[Event], Venue]:
         start_el = el.find(attrs={"itemprop": "startDate"})
         if start_el:
             dt_str = start_el.get("datetime") or start_el.get("content") or start_el.get_text(strip=True)
-            event.date = _parse_date(dt_str)
-            event.time = _parse_time(dt_str)
+            iso_date, iso_time = _parse_iso_datetime(dt_str)
+            if iso_date:
+                event.date = iso_date
+                event.time = iso_time
+            else:
+                event.date = _parse_date(dt_str)
+                event.time = _parse_time(dt_str)
 
         door_el = el.find(attrs={"itemprop": "doorTime"})
         if door_el:
-            event.doors_time = _parse_time(door_el.get("datetime") or door_el.get_text(strip=True))
+            dt_str = door_el.get("datetime") or door_el.get_text(strip=True)
+            _, iso_doors = _parse_iso_datetime(dt_str)
+            event.doors_time = iso_doors or _parse_time(dt_str)
 
         desc_el = el.find(attrs={"itemprop": "description"})
         if desc_el:
@@ -643,6 +690,68 @@ def extract_wp_plugins(soup: BeautifulSoup) -> list[Event]:
             if event.event_name and event.date:
                 event.event_type = classify_event(event.event_name or "", event.description or "").internal_category
                 events.append(event)
+
+    return events
+
+
+# --- Strategy 3.5: FullCalendar / TicketWeb ---
+
+def extract_fullcalendar(soup: BeautifulSoup) -> list[Event]:
+    """Extract events from FullCalendar-based widgets (TicketWeb, etc.).
+
+    Handles the pattern:
+      <a class="fc-event" aria-label="EventName|YYYY-MM-DD|HH:MM AM/PM">
+        <div class="tw-calendar-event-title">...</div>
+        <span class="tw-calendar-event-doors">Doors: 7:00 PM</span>
+        <span class="tw-calendar-event-time">Show: 8:00 PM</span>
+      </a>
+    The parent <td data-date="YYYY-MM-DD"> is used as a date fallback.
+    """
+    events = []
+
+    fc_event_links = soup.select("a.fc-event[aria-label]")
+    if not fc_event_links:
+        return events
+
+    for a_el in fc_event_links:
+        event = Event()
+
+        # Primary: parse the pipe-delimited aria-label "Name|YYYY-MM-DD|HH:MM AM/PM"
+        aria = a_el.get("aria-label", "")
+        parts = [p.strip() for p in aria.split("|")]
+        if parts:
+            event.event_name = parts[0] or None
+        if len(parts) >= 2:
+            iso_date, _ = _parse_iso_datetime(parts[1])
+            event.date = iso_date or _parse_date(parts[1])
+        if len(parts) >= 3:
+            event.time = _parse_time(parts[2])
+
+        # Refine name from explicit title element if present
+        title_el = a_el.select_one(".tw-calendar-event-title, .fc-event-title")
+        if title_el:
+            event.event_name = _clean_text(title_el.get_text(strip=True)) or event.event_name
+
+        # Doors/show times from dedicated spans (more reliable than aria-label time)
+        doors_el = a_el.select_one(".tw-calendar-event-doors")
+        if doors_el:
+            event.doors_time = _parse_time(doors_el.get_text(strip=True))
+
+        show_el = a_el.select_one(".tw-calendar-event-time")
+        if show_el:
+            event.time = _parse_time(show_el.get_text(strip=True))
+
+        # Fallback date from parent <td data-date="...">
+        if not event.date:
+            parent_td = a_el.find_parent("td", attrs={"data-date": True})
+            if parent_td:
+                data_date = parent_td.get("data-date", "")
+                iso_date, _ = _parse_iso_datetime(data_date)
+                event.date = iso_date or _parse_date(data_date)
+
+        if event.event_name and event.date:
+            event.event_type = classify_event(event.event_name, event.description or "").internal_category
+            events.append(event)
 
     return events
 
@@ -865,6 +974,15 @@ def extract_venue_info(soup: BeautifulSoup, url: str) -> Venue:
             venue.address = _clean_text(addr_el.get_text(strip=True))
 
     if not venue.address:
+        # Try the semantic <address> HTML tag
+        addr_tag = soup.find("address")
+        if addr_tag:
+            addr_text = _clean_text(addr_tag.get_text(strip=True))
+            # Basic sanity check: should start with a street number
+            if re.search(r"\d+\s+\w", addr_text):
+                venue.address = addr_text
+
+    if not venue.address:
         # Check footer for address
         footer = soup.find("footer")
         if footer:
@@ -923,6 +1041,13 @@ class EventExtractor:
         if events:
             logger.info("WP plugins: found %d events", len(events))
             return ExtractionResult(venue=venue, events=self._dedup(events), extraction_method="html-heuristic")
+
+        # Strategy 3.5: FullCalendar / TicketWeb
+        logger.info("Trying FullCalendar extraction...")
+        events = extract_fullcalendar(soup)
+        if events:
+            logger.info("FullCalendar: found %d events", len(events))
+            return ExtractionResult(venue=venue, events=self._dedup(events), extraction_method="fullcalendar")
 
         # Strategy 4: Generic HTML
         logger.info("Trying generic HTML extraction...")
