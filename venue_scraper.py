@@ -107,6 +107,18 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 
+# Domains whose JSON API responses we intercept via Playwright (authenticated by the browser session)
+KNOWN_EVENT_API_DOMAINS = [
+    "venuepilot.co",
+]
+
+# After networkidle + 2s wait, wait up to 5s for these selectors to appear
+# (SPA frameworks often render content after initial networkidle)
+SPA_WAIT_SELECTORS = [
+    ".vp-event-card",   # VenuePilot grid/list
+    ".vp-event-name",   # VenuePilot calendar day view
+]
+
 EXTRACTION_PROMPT = """You are extracting event data from a venue website. This includes ALL types of events: live music/concerts, trivia nights, DJ sets, dance nights, open mic, karaoke, comedy shows, and any other scheduled happenings.
 
 URL: {url}
@@ -151,6 +163,8 @@ class PageFetcher:
     def __init__(self):
         self._playwright = None
         self._browser = None
+        # JSON responses intercepted from known event-platform API domains during the last fetch()
+        self.last_captured_api_data: list[dict] = []
 
     async def start(self):
         self._playwright = await async_playwright().start()
@@ -163,9 +177,28 @@ class PageFetcher:
             await self._playwright.stop()
 
     async def fetch(self, url: str) -> tuple[str, str]:
-        """Fetch a URL and return (rendered_html, final_url)."""
+        """Fetch a URL and return (rendered_html, final_url).
+
+        Also captures authenticated JSON responses from known event-platform
+        API domains (e.g. venuepilot.co) into self.last_captured_api_data.
+        """
+        self.last_captured_api_data = []
         context = await self._browser.new_context(user_agent=USER_AGENT)
         page = await context.new_page()
+
+        async def _capture_api_response(response):
+            if any(d in response.url for d in KNOWN_EVENT_API_DOMAINS):
+                try:
+                    ct = response.headers.get("content-type", "")
+                    if "json" in ct:
+                        data = await response.json()
+                        self.last_captured_api_data.append({"url": response.url, "data": data})
+                        logger.info("Captured API response from %s (%d bytes)", response.url, len(str(data)))
+                except Exception as e:
+                    logger.debug("Failed to capture API response from %s: %s", response.url, e)
+
+        page.on("response", _capture_api_response)
+
         try:
             try:
                 await page.goto(url, wait_until="networkidle", timeout=15000)
@@ -174,6 +207,15 @@ class PageFetcher:
                 await page.goto(url, wait_until="domcontentloaded", timeout=15000)
             # Extra wait for any lazy-loaded content
             await page.wait_for_timeout(2000)
+            # For SPA frameworks (VenuePilot, etc.) that render after networkidle,
+            # wait up to 5s for a known event container to appear
+            for sel in SPA_WAIT_SELECTORS:
+                try:
+                    await page.wait_for_selector(sel, timeout=5000)
+                    logger.info("SPA event content ready (%s)", sel)
+                    break
+                except PlaywrightTimeout:
+                    continue
             html = await page.content()
             final_url = page.url
             return html, final_url
@@ -207,6 +249,8 @@ class EventPageFinder:
             "[itemtype*='schema.org/MusicEvent']",
             "a.fc-event[aria-label]",        # FullCalendar (TicketWeb, etc.)
             ".tw-calendar-event-title",       # TicketWeb specific
+            ".vp-event-card",                 # VenuePilot grid/list
+            ".vp-event-name",                 # VenuePilot calendar day view
         ]
         for sel in event_selectors:
             if soup.select_one(sel):
@@ -756,6 +800,192 @@ def extract_fullcalendar(soup: BeautifulSoup) -> list[Event]:
     return events
 
 
+# --- Strategy 3.7: VenuePilot ---
+
+def extract_venuepilot_api(api_responses: list[dict]) -> tuple[list[Event], Venue]:
+    """Parse intercepted VenuePilot API JSON responses into Event/Venue objects.
+
+    VenuePilot's browser SDK makes authenticated calls to venuepilot.co;
+    PageFetcher captures those responses so we can parse them directly.
+    Field names tried cover VenuePilot v1/v2 response shapes.
+    """
+    events: list[Event] = []
+    venue = Venue()
+
+    for resp in api_responses:
+        data = resp.get("data", {})
+
+        # Flatten to a list of raw event dicts
+        if isinstance(data, list):
+            items: list = data
+        elif isinstance(data, dict):
+            items = (
+                data.get("events")
+                or data.get("data")
+                or data.get("items")
+                or []
+            )
+        else:
+            continue
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            event = Event()
+
+            event.event_name = (
+                item.get("name")
+                or item.get("title")
+                or item.get("event_name")
+            )
+
+            start = (
+                item.get("starts_at")
+                or item.get("start_date")
+                or item.get("start")
+                or item.get("startDate", "")
+            )
+            if start:
+                iso_date, iso_time = _parse_iso_datetime(str(start))
+                if iso_date:
+                    event.date, event.time = iso_date, iso_time
+                else:
+                    event.date = _parse_date(str(start))
+                    event.time = _parse_time(str(start))
+
+            door = (
+                item.get("door_time")
+                or item.get("doors_at")
+                or item.get("doorTime", "")
+            )
+            if door:
+                _, iso_doors = _parse_iso_datetime(str(door))
+                event.doors_time = iso_doors or _parse_time(str(door))
+
+            desc = item.get("description") or item.get("body") or ""
+            if desc:
+                event.description = _clean_text(str(desc))[:500]
+
+            event.ticket_url = item.get("ticket_url") or item.get("url")
+
+            price = item.get("price") or item.get("min_price")
+            if price is not None:
+                event.price = str(price)
+
+            # Venue info embedded in each event (VenuePilot includes it)
+            venue_data = item.get("venue") or item.get("location") or {}
+            if isinstance(venue_data, dict):
+                if not venue.name:
+                    venue.name = venue_data.get("name")
+                if not venue.address:
+                    addr = (
+                        venue_data.get("address")
+                        or venue_data.get("full_address")
+                        or venue_data.get("street_address")
+                    )
+                    if addr:
+                        venue.address = str(addr)
+
+            if event.event_name and event.date:
+                event.event_type = classify_event(event.event_name, event.description or "").internal_category
+                events.append(event)
+
+    return events, venue
+
+
+def extract_venuepilot_dom(soup: BeautifulSoup) -> list[Event]:
+    """Extract events from VenuePilot widgets rendered in the DOM.
+
+    Handles two layouts:
+    1. Event list/grid (.vp-event-card.vp-event-info) -- has a .vp-date element
+    2. Calendar day view (.vp-day-wrapper) -- date from month header + day number
+    """
+    events: list[Event] = []
+
+    # ── Layout 1: event list / grid ────────────────────────────────────────
+    for card in soup.select(".vp-event-card.vp-event-info, .vp-event-row"):
+        event = Event()
+
+        name_el = card.select_one(".vp-event-name")
+        if name_el:
+            event.event_name = _clean_text(name_el.get_text(strip=True))
+
+        time_el = card.select_one(".vp-time")
+        if time_el:
+            event.time = _parse_time(time_el.get_text(strip=True))
+
+        date_el = card.select_one(".vp-date, .vp-event-date, time[datetime]")
+        if date_el:
+            dt_str = date_el.get("datetime") or date_el.get_text(strip=True)
+            iso_date, iso_time = _parse_iso_datetime(dt_str)
+            if iso_date:
+                event.date = iso_date
+                if iso_time and not event.time:
+                    event.time = iso_time
+            else:
+                event.date = _parse_date(dt_str)
+
+        if event.event_name and event.date:
+            event.event_type = classify_event(event.event_name, event.description or "").internal_category
+            events.append(event)
+
+    if events:
+        return events
+
+    # ── Layout 2: calendar day view ────────────────────────────────────────
+    # Month/year context lives in a navigation header above the calendar grid.
+    # Walk up from the first vp-day-wrapper to find it.
+    month_year: Optional[str] = None
+    first_day = soup.select_one(".vp-day-wrapper")
+    if first_day:
+        # Search ancestors for a month+year text string
+        el = first_day.parent
+        for _ in range(6):
+            if el is None:
+                break
+            for text in el.find_all(string=True):
+                m = re.search(
+                    r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+                    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|"
+                    r"Dec(?:ember)?)\s*,?\s*\d{4}",
+                    str(text),
+                    re.IGNORECASE,
+                )
+                if m:
+                    month_year = m.group(0)
+                    break
+            if month_year:
+                break
+            el = el.parent
+
+    for day_wrapper in soup.select(".vp-day-wrapper"):
+        day_num_el = day_wrapper.select_one(".vp-day-number")
+        if not day_num_el:
+            continue
+        day_num = day_num_el.get_text(strip=True)
+        date_str = f"{month_year} {day_num}" if month_year else None
+
+        for card in day_wrapper.select(".vp-event-card, .vp-event-info"):
+            event = Event()
+
+            name_el = card.select_one(".vp-event-name")
+            if name_el:
+                event.event_name = _clean_text(name_el.get_text(strip=True))
+
+            time_el = card.select_one(".vp-time")
+            if time_el:
+                event.time = _parse_time(time_el.get_text(strip=True))
+
+            if date_str:
+                event.date = _parse_date(date_str)
+
+            if event.event_name and event.date:
+                event.event_type = classify_event(event.event_name, event.description or "").internal_category
+                events.append(event)
+
+    return events
+
+
 # --- Strategy 4: Generic HTML Pattern Detection ---
 
 def extract_generic_html(soup: BeautifulSoup) -> list[Event]:
@@ -1006,7 +1236,14 @@ def extract_venue_info(soup: BeautifulSoup, url: str) -> Venue:
 class EventExtractor:
     """Runs extraction strategies in priority order."""
 
-    async def extract(self, html: str, url: str, use_llm: bool = True, homepage_html: Optional[str] = None) -> ExtractionResult:
+    async def extract(
+        self,
+        html: str,
+        url: str,
+        use_llm: bool = True,
+        homepage_html: Optional[str] = None,
+        api_data: Optional[list[dict]] = None,
+    ) -> ExtractionResult:
         soup = BeautifulSoup(html, "lxml")
 
         # Get venue info from page metadata
@@ -1018,6 +1255,15 @@ class EventExtractor:
             home_soup = BeautifulSoup(homepage_html, "lxml")
             home_venue = extract_venue_info(home_soup, url)
             venue = self._merge_venue(venue, home_venue)
+
+        # Strategy 0: Intercepted API data (VenuePilot authenticated browser calls)
+        if api_data:
+            logger.info("Trying intercepted API data extraction (%d response(s))...", len(api_data))
+            events, api_venue = extract_venuepilot_api(api_data)
+            if events:
+                logger.info("API intercept: found %d events", len(events))
+                venue = self._merge_venue(venue, api_venue)
+                return ExtractionResult(venue=venue, events=self._dedup(events), extraction_method="api-intercept")
 
         # Strategy 1: JSON-LD
         logger.info("Trying JSON-LD extraction...")
@@ -1048,6 +1294,13 @@ class EventExtractor:
         if events:
             logger.info("FullCalendar: found %d events", len(events))
             return ExtractionResult(venue=venue, events=self._dedup(events), extraction_method="fullcalendar")
+
+        # Strategy 3.7: VenuePilot DOM (rendered vp-* elements)
+        logger.info("Trying VenuePilot DOM extraction...")
+        events = extract_venuepilot_dom(soup)
+        if events:
+            logger.info("VenuePilot DOM: found %d events", len(events))
+            return ExtractionResult(venue=venue, events=self._dedup(events), extraction_method="venuepilot-dom")
 
         # Strategy 4: Generic HTML
         logger.info("Trying generic HTML extraction...")
@@ -1364,7 +1617,7 @@ async def main():
 
         # Step 2: Extract events
         extractor = EventExtractor()
-        result = await extractor.extract(html, events_url, use_llm=use_llm, homepage_html=homepage_html)
+        result = await extractor.extract(html, events_url, use_llm=use_llm, homepage_html=homepage_html, api_data=fetcher.last_captured_api_data or None)
 
         # Step 3: Filter by date range if requested
         events = result.events

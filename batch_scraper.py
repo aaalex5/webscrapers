@@ -74,7 +74,7 @@ async def scrape_venue(
         html, events_url, homepage_html = await finder.find_events_page(fetcher, url, use_llm=use_llm)
 
         extractor = vs.EventExtractor()
-        result = await extractor.extract(html, events_url, use_llm=use_llm, homepage_html=homepage_html)
+        result = await extractor.extract(html, events_url, use_llm=use_llm, homepage_html=homepage_html, api_data=fetcher.last_captured_api_data or None)
 
         events = result.events
         if days is not None:
