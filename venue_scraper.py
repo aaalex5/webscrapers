@@ -3,15 +3,17 @@
 
 import argparse
 import asyncio
+import html
 import json
 import logging
 import re
 import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Optional
-from urllib.parse import urljoin, urlparse, quote_plus
+from urllib.parse import urljoin, urlparse, quote_plus, parse_qs, unquote
 from urllib.request import urlopen, Request
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
@@ -56,6 +58,9 @@ class ExtractionResult:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+VENUE_HEALTH_FILE = Path(__file__).parent / "venue_health.json"
+KNOWN_VENUES_FILE = Path(__file__).parent / "KNOWN_VENUES.md"
 
 CALENDAR_KEYWORDS = [
     "events", "calendar", "shows", "schedule", "lineup",
@@ -241,6 +246,11 @@ class EventPageFinder:
             except (json.JSONDecodeError, TypeError):
                 continue
 
+        # Check for VenuePilot widget script tag (events loaded dynamically;
+        # the container is empty in static HTML, so check the script instead)
+        if soup.find("script", src=re.compile(r"venuepilot\.co/widgets/", re.IGNORECASE)):
+            return True
+
         # Check for known event plugin selectors
         event_selectors = [
             ".tribe-events", ".tribe-events-calendar",
@@ -251,6 +261,7 @@ class EventPageFinder:
             ".tw-calendar-event-title",       # TicketWeb specific
             ".vp-event-card",                 # VenuePilot grid/list
             ".vp-event-name",                 # VenuePilot calendar day view
+            "article.eventlist-event",        # Squarespace events collection
         ]
         for sel in event_selectors:
             if soup.select_one(sel):
@@ -461,8 +472,152 @@ def _parse_iso_datetime(text: str) -> tuple[Optional[str], Optional[str]]:
 
 
 def _clean_text(text: str) -> str:
-    """Clean whitespace from extracted text."""
-    return re.sub(r"\s+", " ", text).strip()
+    """Strip HTML tags, decode HTML entities, and clean whitespace."""
+    unescaped = html.unescape(text)
+    no_tags = re.sub(r"<[^>]+>", " ", unescaped)
+    return re.sub(r"\s+", " ", no_tags).strip()
+
+
+_TIME_IN_ADDR = re.compile(
+    r"\b(?:am|pm|a\.m\.|p\.m\.|doors?|show|start|monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_valid_address(addr: str) -> bool:
+    """Return True only if addr looks like a real street address.
+
+    Rejects strings that contain time/day-of-week words (e.g. "00 PM Poached Pink St")
+    or start with a degenerate street number like "00".
+    """
+    if not addr:
+        return False
+    if _TIME_IN_ADDR.search(addr):
+        return False
+    m = re.match(r"(\d+)", addr.strip())
+    if m and m.group(1) == "00":
+        return False
+    return True
+
+
+# --- Strategy 0.5: Google Calendar iCal ---
+
+def _detect_google_calendar_ids(soup: BeautifulSoup) -> list[str]:
+    """Return calendar IDs for any Google Calendar iframes embedded on the page."""
+    ids = []
+    for iframe in soup.find_all("iframe"):
+        src = iframe.get("src", "")
+        if "calendar.google.com/calendar/embed" in src:
+            params = parse_qs(urlparse(src).query)
+            for cal_id in params.get("src", []):
+                ids.append(unquote(cal_id))
+    return ids
+
+
+def _fetch_ical(calendar_id: str) -> str:
+    """Fetch the public iCal feed for a Google Calendar ID."""
+    encoded_id = quote_plus(calendar_id)
+    url = f"https://calendar.google.com/calendar/ical/{encoded_id}/public/basic.ics"
+    req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/calendar"})
+    with urlopen(req, timeout=15) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _parse_ical_dt(value: str) -> tuple[Optional[str], Optional[str]]:
+    """Convert an iCal datetime value to (YYYY-MM-DD, HH:MM) in PST.
+
+    Handles compact iCal formats:
+      20260315T190000Z   — UTC datetime
+      20260315T190000    — naive datetime (treated as PST)
+      20260315           — date only
+    """
+    value = value.strip()
+    # Date-only: YYYYMMDD
+    if re.fullmatch(r"\d{8}", value):
+        iso = f"{value[:4]}-{value[4:6]}-{value[6:8]}"
+        return iso, None
+    # Datetime: YYYYMMDDTHHmmss[Z]
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)", value)
+    if m:
+        yr, mo, dy, hh, mm, ss, utc = m.groups()
+        iso = f"{yr}-{mo}-{dy}T{hh}:{mm}:{ss}" + ("+00:00" if utc else "")
+        return _parse_iso_datetime(iso)
+    return None, None
+
+
+def extract_google_calendar(soup: BeautifulSoup) -> tuple[list[Event], Venue, list[str]]:
+    """Detect Google Calendar iframes and fetch events from the iCal feed.
+
+    Returns (events, venue, calendar_ids_found).  venue.address may be
+    populated from LOCATION fields on the first event that has one.
+    """
+    cal_ids = _detect_google_calendar_ids(soup)
+    if not cal_ids:
+        return [], Venue(), []
+
+    events: list[Event] = []
+    venue = Venue()
+
+    for cal_id in cal_ids:
+        try:
+            ical_text = _fetch_ical(cal_id)
+        except Exception as e:
+            logger.warning("Google Calendar fetch failed for %s: %s", cal_id, e)
+            continue
+
+        # Unfold continuation lines (RFC 5545 §3.1)
+        unfolded_lines: list[str] = []
+        for raw in ical_text.splitlines():
+            if raw.startswith((" ", "\t")) and unfolded_lines:
+                unfolded_lines[-1] += raw[1:]
+            else:
+                unfolded_lines.append(raw)
+
+        in_event = False
+        props: dict[str, str] = {}
+        for line in unfolded_lines:
+            stripped = line.strip()
+            if stripped == "BEGIN:VEVENT":
+                in_event = True
+                props = {}
+            elif stripped == "END:VEVENT":
+                if in_event:
+                    # Parse properties into an Event
+                    ev = Event()
+                    summary = props.get("SUMMARY", "")
+                    if summary:
+                        ev.event_name = _clean_text(
+                            summary.replace("\\n", " ").replace("\\,", ",")
+                        )
+                    desc = props.get("DESCRIPTION", "")
+                    if desc:
+                        ev.description = _clean_text(
+                            desc.replace("\\n", " ").replace("\\,", ",").replace("\\;", ";")
+                        )[:500]
+                    dtstart = props.get("DTSTART", "")
+                    if dtstart:
+                        ev.date, ev.time = _parse_ical_dt(dtstart)
+                    ev.ticket_url = props.get("URL") or None
+
+                    location = props.get("LOCATION", "").replace("\\,", ",").strip()
+                    if location and not venue.address and re.search(r"\d+\s+\w", location):
+                        venue.address = _clean_text(location)
+
+                    if ev.event_name and ev.date:
+                        ev.event_type = classify_event(
+                            ev.event_name, ev.description or ""
+                        ).internal_category
+                        events.append(ev)
+                in_event = False
+                props = {}
+            elif in_event and ":" in line:
+                # Strip property parameters (e.g. DTSTART;TZID=America/Los_Angeles → DTSTART)
+                key, _, value = line.partition(":")
+                key = key.split(";")[0].upper()
+                props[key] = value
+
+    return events, venue, cal_ids
 
 
 # --- Strategy 1: JSON-LD / Schema.org ---
@@ -505,8 +660,8 @@ def _extract_venue_from_jsonld_schema(data, venue: Venue):
     if any(tp in business_types for tp in types):
         if not venue.name:
             venue.name = data.get("name")
-        if not venue.address:
-            address = data.get("address")
+        address = data.get("address")
+        if address:
             if isinstance(address, dict):
                 parts = [
                     address.get("streetAddress", ""),
@@ -514,11 +669,15 @@ def _extract_venue_from_jsonld_schema(data, venue: Venue):
                     address.get("addressRegion", ""),
                     address.get("postalCode", ""),
                 ]
-                joined = ", ".join(p for p in parts if p)
-                if joined:
-                    venue.address = joined
-            elif isinstance(address, str) and address:
-                venue.address = address
+                candidate = ", ".join(p.strip() for p in parts if p.strip())
+            elif isinstance(address, str):
+                candidate = re.sub(r"\s+", " ", address).strip()
+            else:
+                candidate = None
+            if candidate:
+                has_street = bool(re.search(r"\d+\s+\w", candidate))
+                if has_street or not venue.address:
+                    venue.address = candidate
 
 
 def _process_jsonld(data, events: list[Event], venue: Venue):
@@ -596,7 +755,7 @@ def _process_jsonld(data, events: list[Event], venue: Venue):
             if not venue.name:
                 venue.name = location.get("name")
             address = location.get("address")
-            if address and not venue.address:
+            if address:
                 if isinstance(address, dict):
                     parts = [
                         address.get("streetAddress", ""),
@@ -604,9 +763,16 @@ def _process_jsonld(data, events: list[Event], venue: Venue):
                         address.get("addressRegion", ""),
                         address.get("postalCode", ""),
                     ]
-                    venue.address = ", ".join(p for p in parts if p)
+                    candidate = ", ".join(p.strip() for p in parts if p.strip())
                 elif isinstance(address, str):
-                    venue.address = address
+                    candidate = re.sub(r"\s+", " ", address).strip()
+                else:
+                    candidate = None
+                # Only set if it's a street-level address or we have nothing yet
+                if candidate:
+                    has_street = bool(re.search(r"\d+\s+\w", candidate))
+                    if has_street or not venue.address:
+                        venue.address = candidate
 
         if event.event_name and event.date:
             event.event_type = classify_event(event.event_name or "", event.description or "").internal_category
@@ -815,16 +981,31 @@ def extract_venuepilot_api(api_responses: list[dict]) -> tuple[list[Event], Venu
     for resp in api_responses:
         data = resp.get("data", {})
 
-        # Flatten to a list of raw event dicts
+        # Flatten to a list of raw event dicts.
+        # Handles REST shapes and VenuePilot's GraphQL shape:
+        #   { "data": { "paginatedEvents": { "collection": [...] } } }
+        def _find_event_list(obj) -> list:
+            if isinstance(obj, list):
+                return obj
+            if not isinstance(obj, dict):
+                return []
+            # Direct keys
+            for key in ("events", "items", "collection", "nodes", "edges"):
+                val = obj.get(key)
+                if isinstance(val, list):
+                    return val
+            # Recurse one level into any dict value
+            for val in obj.values():
+                if isinstance(val, dict):
+                    result = _find_event_list(val)
+                    if result:
+                        return result
+            return []
+
         if isinstance(data, list):
             items: list = data
         elif isinstance(data, dict):
-            items = (
-                data.get("events")
-                or data.get("data")
-                or data.get("items")
-                or []
-            )
+            items = _find_event_list(data)
         else:
             continue
 
@@ -839,34 +1020,52 @@ def extract_venuepilot_api(api_responses: list[dict]) -> tuple[list[Event], Venu
                 or item.get("event_name")
             )
 
-            start = (
-                item.get("starts_at")
+            # VenuePilot GraphQL: separate "date" + "startTime" fields
+            event_date_str = item.get("date", "")
+            start_time_str = (
+                item.get("startTime")
+                or item.get("start_time")
+                or item.get("starts_at")
                 or item.get("start_date")
                 or item.get("start")
                 or item.get("startDate", "")
             )
-            if start:
-                iso_date, iso_time = _parse_iso_datetime(str(start))
+            if event_date_str and start_time_str and "T" not in str(start_time_str):
+                # Combine "2026-03-21" + "21:00:00" → ISO datetime
+                combined = f"{event_date_str}T{start_time_str}"
+                iso_date, iso_time = _parse_iso_datetime(combined)
+                event.date = iso_date or event_date_str
+                event.time = iso_time
+            elif event_date_str:
+                event.date = event_date_str
+            elif start_time_str:
+                start = str(start_time_str)
+                iso_date, iso_time = _parse_iso_datetime(start)
                 if iso_date:
                     event.date, event.time = iso_date, iso_time
                 else:
-                    event.date = _parse_date(str(start))
-                    event.time = _parse_time(str(start))
+                    event.date = _parse_date(start)
+                    event.time = _parse_time(start)
 
-            door = (
-                item.get("door_time")
+            door_str = (
+                item.get("doorTime")
+                or item.get("door_time")
                 or item.get("doors_at")
-                or item.get("doorTime", "")
+                or ""
             )
-            if door:
-                _, iso_doors = _parse_iso_datetime(str(door))
-                event.doors_time = iso_doors or _parse_time(str(door))
+            if door_str and event_date_str and "T" not in str(door_str):
+                combined_door = f"{event_date_str}T{door_str}"
+                _, iso_doors = _parse_iso_datetime(combined_door)
+                event.doors_time = iso_doors or _parse_time(str(door_str))
+            elif door_str:
+                _, iso_doors = _parse_iso_datetime(str(door_str))
+                event.doors_time = iso_doors or _parse_time(str(door_str))
 
             desc = item.get("description") or item.get("body") or ""
             if desc:
                 event.description = _clean_text(str(desc))[:500]
 
-            event.ticket_url = item.get("ticket_url") or item.get("url")
+            event.ticket_url = item.get("ticket_url") or item.get("ticketsUrl") or item.get("websiteUrl") or item.get("url")
 
             price = item.get("price") or item.get("min_price")
             if price is not None:
@@ -986,10 +1185,112 @@ def extract_venuepilot_dom(soup: BeautifulSoup) -> list[Event]:
     return events
 
 
+# --- Strategy 3.9: Squarespace Events ---
+
+def extract_squarespace(soup: BeautifulSoup) -> list[Event]:
+    """Extract events from Squarespace event list pages.
+
+    Handles the standard Squarespace events collection layout:
+      <article class="eventlist-event ...">
+        <h1 class="eventlist-title"><a class="eventlist-title-link">...</a></h1>
+        <time class="event-date" datetime="YYYY-MM-DD">...</time>
+        <time class="event-time-localized-start">7:30 PM</time>
+        <div class="eventlist-description">...</div>
+      </article>
+    """
+    events: list[Event] = []
+
+    articles = soup.select("article.eventlist-event")
+    if not articles:
+        return events
+
+    for article in articles:
+        event = Event()
+
+        title_el = article.select_one(".eventlist-title-link, .eventlist-title a")
+        if title_el:
+            event.event_name = _clean_text(title_el.get_text(strip=True))
+
+        date_el = article.select_one("time.event-date")
+        if date_el:
+            dt_str = date_el.get("datetime") or date_el.get_text(strip=True)
+            iso_date, _ = _parse_iso_datetime(dt_str)
+            event.date = iso_date or _parse_date(dt_str)
+
+        time_el = article.select_one("time.event-time-localized-start")
+        if time_el:
+            event.time = _parse_time(time_el.get_text(strip=True))
+
+        desc_el = article.select_one(".eventlist-description")
+        if desc_el:
+            event.description = _clean_text(desc_el.get_text(strip=True))[:500]
+
+        if event.event_name and event.date:
+            event.event_type = classify_event(event.event_name, event.description or "").internal_category
+            events.append(event)
+
+    return events
+
+
 # --- Strategy 4: Generic HTML Pattern Detection ---
+
+_WIX_DATE_RE = re.compile(
+    r"^(\w+\s+\d{1,2},\s*\d{4}),\s*(\d{1,2}:\d{2}\s*[AP]M)",
+    re.IGNORECASE,
+)
+
+
+def _extract_wix_events(soup: BeautifulSoup) -> list[Event]:
+    """Extract events from a Wix Events widget (data-hook='EVENTS_ROOT_NODE')."""
+    widget = soup.find(attrs={"data-hook": "EVENTS_ROOT_NODE"})
+    if not widget:
+        return []
+    items = widget.find_all(attrs={"data-hook": "event-list-item"})
+    if not items:
+        return []
+    events = []
+    for item in items:
+        event = Event()
+
+        title_el = item.find(attrs={"data-hook": "ev-list-item-title"})
+        if title_el:
+            event.event_name = _clean_text(title_el.get_text(strip=True))
+
+        date_el = item.find(attrs={"data-hook": "date"})
+        if date_el:
+            date_text = date_el.get_text(strip=True)
+            m = _WIX_DATE_RE.match(date_text)
+            if m:
+                event.date = _parse_date(m.group(1))
+                event.time = _parse_time(m.group(2))
+            else:
+                event.date = _parse_date(date_text)
+
+        loc_el = item.find(attrs={"data-hook": "location"})
+        if loc_el:
+            event.address = _clean_text(loc_el.get_text(strip=True))
+
+        desc_el = item.find(attrs={"data-hook": "ev-list-item-description"})
+        if desc_el:
+            desc = _clean_text(desc_el.get_text(strip=True))
+            if len(desc) > 20:
+                event.description = desc[:500]
+
+        if event.event_name and event.date:
+            event.event_type = classify_event(
+                event.event_name or "", event.description or ""
+            ).internal_category
+            events.append(event)
+    return events
+
 
 def extract_generic_html(soup: BeautifulSoup) -> list[Event]:
     """Detect repeated HTML structures containing date patterns."""
+    # Try Wix Events widget first (structured, reliable)
+    wix_events = _extract_wix_events(soup)
+    if wix_events:
+        return wix_events
+
     events = []
 
     # Remove nav, header, footer to reduce noise
@@ -1053,8 +1354,17 @@ def extract_generic_html(soup: BeautifulSoup) -> list[Event]:
         if time_matches:
             event.time = _parse_time(time_matches[0])
             if len(time_matches) > 1:
-                event.doors_time = _parse_time(time_matches[0])
-                event.time = _parse_time(time_matches[1])
+                # Check if the two times are a start-to-end range (e.g. "10pm to 1am")
+                # rather than a doors/show pair. If "to" appears between them, treat
+                # the first as the show time and ignore the second (end time).
+                between = re.search(
+                    re.escape(time_matches[0]) + r"\s*(?:–|-|to)\s*" + re.escape(time_matches[1]),
+                    card_text,
+                    re.IGNORECASE,
+                )
+                if not between:
+                    event.doors_time = _parse_time(time_matches[0])
+                    event.time = _parse_time(time_matches[1])
 
         # Extract doors time specifically
         doors_match = DOORS_PATTERN.search(card_text)
@@ -1212,19 +1522,34 @@ def extract_venue_info(soup: BeautifulSoup, url: str) -> Venue:
             if re.search(r"\d+\s+\w", addr_text):
                 venue.address = addr_text
 
+    _STREET_PATTERN = (
+        r"\d+\s+(?:[NSEW]\w*\s+)?"           # street number + optional direction
+        r"[\w\s]{2,30}"                        # street name
+        r"(?:St(?:reet)?|Ave(?:nue)?|Blvd|Rd|Drive|Dr|Way|Ln|Lane|Pl|Ct|Pike|Hwy)"
+        r"(?:[.,]?\s*[\w\s]{0,30},?\s*[A-Z]{2}(?:\s*\d{5})?)?"  # optional city, state, zip
+    )
+
     if not venue.address:
         # Check footer for address
         footer = soup.find("footer")
         if footer:
             footer_text = footer.get_text(separator=" ", strip=True)
-            # Look for street address pattern
-            addr_match = re.search(
-                r"\d+\s+[\w\s]+(?:St(?:reet)?|Ave(?:nue)?|Blvd|Rd|Dr|Way|Ln|Pl|Ct|Pike|Hwy)"
-                r"[.,]?\s*[\w\s]*,?\s*[A-Z]{2}\s*\d{5}",
-                footer_text,
-            )
+            addr_match = re.search(_STREET_PATTERN, footer_text)
             if addr_match:
-                venue.address = _clean_text(addr_match.group())
+                candidate = _clean_text(addr_match.group())
+                if _is_valid_address(candidate):
+                    venue.address = candidate
+
+    if not venue.address:
+        # Last resort: scan the full page body for a street address
+        body = soup.find("body")
+        if body:
+            body_text = body.get_text(separator=" ", strip=True)
+            addr_match = re.search(_STREET_PATTERN, body_text)
+            if addr_match:
+                candidate = _clean_text(addr_match.group())
+                if _is_valid_address(candidate):
+                    venue.address = candidate
 
     return venue
 
@@ -1255,6 +1580,15 @@ class EventExtractor:
             home_soup = BeautifulSoup(homepage_html, "lxml")
             home_venue = extract_venue_info(home_soup, url)
             venue = self._merge_venue(venue, home_venue)
+
+        # Strategy 0.5: Google Calendar iframe embed
+        gcal_events, gcal_venue, gcal_ids = extract_google_calendar(soup)
+        if gcal_events:
+            logger.info("Google Calendar: found %d events from %d calendar(s)", len(gcal_events), len(gcal_ids))
+            venue = self._merge_venue(venue, gcal_venue)
+            return ExtractionResult(venue=venue, events=self._dedup(gcal_events), extraction_method="google-calendar")
+        elif gcal_ids:
+            logger.info("Google Calendar iframe detected but iCal fetch failed or returned no events")
 
         # Strategy 0: Intercepted API data (VenuePilot authenticated browser calls)
         if api_data:
@@ -1302,6 +1636,13 @@ class EventExtractor:
             logger.info("VenuePilot DOM: found %d events", len(events))
             return ExtractionResult(venue=venue, events=self._dedup(events), extraction_method="venuepilot-dom")
 
+        # Strategy 3.9: Squarespace events collection
+        logger.info("Trying Squarespace extraction...")
+        events = extract_squarespace(soup)
+        if events:
+            logger.info("Squarespace: found %d events", len(events))
+            return ExtractionResult(venue=venue, events=self._dedup(events), extraction_method="squarespace")
+
         # Strategy 4: Generic HTML
         logger.info("Trying generic HTML extraction...")
         events = extract_generic_html(BeautifulSoup(html, "lxml"))  # Fresh soup since Strategy 4 decomposes elements
@@ -1330,10 +1671,23 @@ class EventExtractor:
         return ExtractionResult(venue=venue, events=[], extraction_method=None)
 
     def _merge_venue(self, base: Venue, other: Venue) -> Venue:
-        """Merge venue info, preferring non-None values from other."""
+        """Merge venue info, preferring non-None values from other.
+
+        Street-level addresses (containing a street number) always beat
+        city/state-only values regardless of which side they come from.
+        """
+        def _has_street(addr: Optional[str]) -> bool:
+            return bool(addr and re.search(r"\d+\s+\w", addr))
+
+        a, b = base.address, other.address
+        if _has_street(a) and not _has_street(b):
+            merged_address = a
+        else:
+            merged_address = b or a
+
         return Venue(
             name=other.name or base.name,
-            address=other.address or base.address,
+            address=merged_address,
             url=base.url or other.url,
         )
 
@@ -1366,6 +1720,92 @@ def geocode_address(address: str) -> tuple[Optional[float], Optional[float]]:
     except Exception as e:
         logger.warning("Geocoding failed for '%s': %s", address, e)
     return None, None
+
+
+def load_venue_health() -> dict:
+    """Load the venue health tracking file. Returns empty dict if not found."""
+    try:
+        return json.loads(VENUE_HEALTH_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_venue_health(url: str, strategy: Optional[str], event_count: int) -> None:
+    """Record the extraction strategy and event count for a venue URL."""
+    health = load_venue_health()
+    health[url] = {
+        "strategy": strategy,
+        "event_count": event_count,
+        "last_run": date.today().isoformat(),
+    }
+    VENUE_HEALTH_FILE.write_text(json.dumps(health, indent=2), encoding="utf-8")
+
+
+def load_known_venues() -> list[str]:
+    """Parse KNOWN_VENUES.md and return a list of clean venue URLs."""
+    if not KNOWN_VENUES_FILE.exists():
+        return []
+    urls = []
+    for line in KNOWN_VENUES_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or not line.startswith("http"):
+            continue
+        # URL is always the first space-delimited token; everything after is notes
+        url = line.split()[0]
+        urls.append(url)
+    return urls
+
+
+def _enrich_event_from_description(event: Event) -> None:
+    """Fill in missing time/price fields by parsing the event description text.
+
+    Called as a fallback before formatting when structured scraping didn't find
+    these values (or returned a suspicious $0 price from external-ticket pages).
+    """
+    if not event.description:
+        return
+
+    desc = event.description
+
+    # ── Time fallback ─────────────────────────────────────────────────────────
+    # Patterns handled:
+    #   "7pm Doors 8pm Show"  →  doors=7pm, show=8pm
+    #   "Doors 7pm Show 8pm"  →  doors=7pm, show=8pm
+    #   "8pm Show"            →  show=8pm
+    TIME_RE = r"(\d{1,2}(?::\d{2})?\s*(?:am|pm))"
+
+    if not event.doors_time:
+        # Time immediately followed by "doors" OR "doors" immediately followed by time
+        m = re.search(rf"{TIME_RE}\s*doors?", desc, re.IGNORECASE)
+        if not m:
+            m = re.search(rf"doors?\s*{TIME_RE}", desc, re.IGNORECASE)
+        if m:
+            event.doors_time = _parse_time(m.group(1))
+
+    if not event.time:
+        # Time immediately followed by "show"/"start"
+        m = re.search(rf"{TIME_RE}\s*(?:show|start)", desc, re.IGNORECASE)
+        if not m:
+            m = re.search(rf"(?:show|start)s?\s*(?:at\s*)?{TIME_RE}", desc, re.IGNORECASE)
+        if m:
+            event.time = _parse_time(m.group(1))
+
+    # If we still don't have a show time but found doors, try the second time
+    # mention in the description as the show time.
+    if not event.time and event.doors_time:
+        all_times = re.findall(rf"{TIME_RE}", desc, re.IGNORECASE)
+        if len(all_times) >= 2:
+            event.time = _parse_time(all_times[1])
+
+    # ── Price fallback ────────────────────────────────────────────────────────
+    # Only override if price is missing or the suspicious "$0" from structured data.
+    price_is_zero = event.price is not None and re.match(r"^\$?0(\.0+)?$", event.price.strip())
+    if not event.price or price_is_zero:
+        # Look for "$10" style prices; ignore "$0"
+        candidates = re.findall(r"\$(\d+(?:\.\d{2})?)", desc)
+        non_zero = [c for c in candidates if float(c) > 0]
+        if non_zero:
+            event.price = f"${non_zero[0]}"
 
 
 def _parse_pricing(price_str: Optional[str]) -> dict:
@@ -1529,13 +1969,19 @@ def _description_from_intermediate(intermediate: dict) -> str:
 
 def format_output_event(event: Event, venue: Venue, venue_url: str) -> dict:
     """Transform an internal Event into the target output format."""
+    _enrich_event_from_description(event)
     intermediate = _build_event_intermediate(event, venue, venue_url)
     if intermediate["warnings"]:
         logger.debug("Event '%s' intermediate warnings: %s", event.event_name, intermediate["warnings"])
     description = _description_from_intermediate(intermediate)
 
+    _GENERIC_NAMES = {"organization", "event", "venue", "show", "performance", "concert"}
+    effective_name = event.event_name
+    if not effective_name or effective_name.strip().lower() in _GENERIC_NAMES:
+        effective_name = venue.name or event.event_name
+
     prefix = TITLE_PREFIX_MAP.get(event.event_type or "", "")
-    title = f"{prefix}{event.event_name}" if event.event_name else event.event_name
+    title = f"{prefix}{effective_name}" if effective_name else effective_name
 
     return {
         "title": title,
@@ -1581,13 +2027,95 @@ examples:
   python venue_scraper.py https://www.catscradle.com --no-llm
         """,
     )
-    parser.add_argument("url", metavar="URL", help="Venue website URL (homepage or events page)")
+    parser.add_argument("url", metavar="URL", nargs="?", help="Venue website URL (homepage or events page)")
     parser.add_argument("-o", "--output", metavar="FILE", help="Write JSON output to file (default: stdout)")
     parser.add_argument("-d", "--days", type=int, default=None, metavar="N",
                         help="Only show events within the next N days (default: show all)")
     parser.add_argument("--no-llm", action="store_true", help="Disable LLM fallback (rule-based only)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Print progress and debug info to stderr")
+    parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="Run extraction against all KNOWN_VENUES and print a status report. Does not write output.",
+    )
     return parser.parse_args()
+
+
+async def run_health_check(use_llm: bool) -> int:
+    """Run extraction against all KNOWN_VENUES and print a status report.
+
+    Returns exit code: 0 if all OK, 1 if any venue has warnings or errors.
+    """
+    venues = load_known_venues()
+    if not venues:
+        print("No venues found in KNOWN_VENUES.md", file=sys.stderr)
+        return 1
+
+    health = load_venue_health()
+    fetcher = PageFetcher()
+    await fetcher.start()
+
+    rows = []
+    any_issue = False
+
+    try:
+        for url in venues:
+            status = "OK"
+            strategy = None
+            event_count = 0
+            note = ""
+            try:
+                finder = EventPageFinder()
+                html_content, events_url, homepage_html = await finder.find_events_page(
+                    fetcher, url, use_llm=use_llm
+                )
+                extractor = EventExtractor()
+                result = await extractor.extract(
+                    html_content, events_url, use_llm=use_llm,
+                    homepage_html=homepage_html,
+                    api_data=fetcher.last_captured_api_data or None,
+                )
+                strategy = result.extraction_method
+                event_count = len(result.events)
+                fetcher.last_captured_api_data = None
+
+                prev = health.get(url, {})
+                if event_count == 0:
+                    status = "ERROR"
+                    any_issue = True
+                elif prev.get("strategy") and prev["strategy"] != strategy:
+                    status = "WARN"
+                    note = f"[was: {prev['strategy']}]"
+                    any_issue = True
+
+                save_venue_health(url, strategy, event_count)
+            except Exception as exc:
+                status = "ERROR"
+                note = str(exc)[:60]
+                any_issue = True
+
+            rows.append((status, url, strategy or "—", event_count, note))
+    finally:
+        await fetcher.stop()
+
+    # Print report
+    print("\nVENUE HEALTH CHECK")
+    print("=" * 70)
+    for status, url, strategy, count, note in rows:
+        domain = urlparse(url).netloc or url
+        events_str = f"{count} event{'s' if count != 1 else ''}"
+        line = f"{status:<6} {domain:<35} {strategy:<20} {events_str}"
+        if note:
+            line += f"  {note}"
+        print(line)
+    print()
+
+    ok_count = sum(1 for r in rows if r[0] == "OK")
+    warn_count = sum(1 for r in rows if r[0] == "WARN")
+    err_count = sum(1 for r in rows if r[0] == "ERROR")
+    print(f"Result: {ok_count} OK  {warn_count} WARN  {err_count} ERROR")
+
+    return 1 if any_issue else 0
 
 
 async def main():
@@ -1607,6 +2135,15 @@ async def main():
         if not os.environ.get("ANTHROPIC_API_KEY"):
             logger.warning("ANTHROPIC_API_KEY not set. LLM fallback will fail if needed. Use --no-llm to disable.")
 
+    # Health check mode: validate all KNOWN_VENUES, then exit
+    if args.health_check:
+        exit_code = await run_health_check(use_llm=use_llm)
+        sys.exit(exit_code)
+
+    if not args.url:
+        print("error: URL is required unless --health-check is specified", file=sys.stderr)
+        sys.exit(1)
+
     fetcher = PageFetcher()
     await fetcher.start()
 
@@ -1618,6 +2155,18 @@ async def main():
         # Step 2: Extract events
         extractor = EventExtractor()
         result = await extractor.extract(html, events_url, use_llm=use_llm, homepage_html=homepage_html, api_data=fetcher.last_captured_api_data or None)
+
+        # Step 2b: Strategy regression check
+        health = load_venue_health()
+        prev = health.get(args.url, {})
+        if prev.get("strategy") and prev["strategy"] != result.extraction_method:
+            print(
+                f"WARNING: Extraction strategy changed for {args.url}: "
+                f"was '{prev['strategy']}', now '{result.extraction_method}'. "
+                "Site may have been redesigned — verify events look correct.",
+                file=sys.stderr,
+            )
+        save_venue_health(args.url, result.extraction_method, len(result.events))
 
         # Step 3: Filter by date range if requested
         events = result.events

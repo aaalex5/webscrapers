@@ -129,9 +129,10 @@ RULES: dict[str, dict[str, list[str]]] = {
     },
 
     "open_mic": {
-        "strong": ["open mic", "open mike"],
-        "medium": ["songwriter night", "writers night", "acoustic showcase"],
-        "weak":   ["acoustic night", "unplugged"],
+        "strong": ["open mic", "open mike", "jam sign-up", "jam sign up", "open jam", "jam session"],
+        "medium": ["songwriter night", "writers night", "acoustic showcase", "jam night", "jam monday",
+                   "jam tuesday", "jam wednesday", "jam thursday", "jam friday", "jam saturday", "jam sunday"],
+        "weak":   ["acoustic night", "unplugged", "jam"],
     },
 
     "karaoke": {
